@@ -35,23 +35,23 @@ def scale_A_by_spectral_radius(A):
 class MLP(nn.Module):
 
     def __init__(self, in_dim, out_dim, num_layers, hidden, drop_rate,
-                 use_batchnorm=False, is_output_layer=False):
+                 use_batchnorm=False, is_output_layer=False, dtype=torch.float64):
         super().__init__()
         self.num_layers = num_layers
         self.use_batchnorm = use_batchnorm
         self.is_output_layer = is_output_layer
 
         self.lin = nn.ModuleList()
-        self.lin.append(nn.Linear(in_dim, hidden))
+        self.lin.append(nn.Linear(in_dim, hidden, dtype=dtype))
         for i in range(1, num_layers - 1):
-            self.lin.append(nn.Linear(hidden, hidden))
-        self.lin.append(nn.Linear(hidden, out_dim))
+            self.lin.append(nn.Linear(hidden, hidden, dtype=dtype))
+        self.lin.append(nn.Linear(hidden, out_dim, dtype=dtype))
         if use_batchnorm:
             self.batchnorm = nn.ModuleList()
             for i in range(0, num_layers - 1):
-                self.batchnorm.append(nn.BatchNorm1d(hidden))
+                self.batchnorm.append(nn.BatchNorm1d(hidden, dtype=dtype))
             if not is_output_layer:
-                self.batchnorm.append(nn.BatchNorm1d(out_dim))
+                self.batchnorm.append(nn.BatchNorm1d(out_dim, dtype=dtype))
         self.dropout = nn.Dropout(drop_rate)
 
     def forward(self, R):  # R: (*, in_dim)
@@ -73,12 +73,12 @@ class MLP(nn.Module):
 # A GCN layer.
 class GCNConv(nn.Module):
 
-    def __init__(self, AA, in_dim, out_dim):
+    def __init__(self, AA, in_dim, out_dim, dtype=torch.float64):
         super().__init__()
         self.AA = AA  # normalized A
         self.in_dim = in_dim
         self.out_dim = out_dim
-        self.fc = nn.Linear(in_dim, out_dim)
+        self.fc = nn.Linear(in_dim, out_dim, dtype=dtype)
 
     def forward(self, R):  # R: (n, batch_size, in_dim)
         assert len(R.shape) == 3
@@ -102,7 +102,7 @@ class GCNConv(nn.Module):
 class ResGCN(nn.Module):
 
     def __init__(self, A, num_layers, embed, hidden, drop_rate,
-                 scale_input=True, dtype=torch.float32):
+                 scale_input=True, dtype=torch.float64):
         # A: float64, already on device.
         #
         # For graph convolution, A will be normalized and cast to
@@ -122,14 +122,14 @@ class ResGCN(nn.Module):
 
         self.mlp_initial = MLP(1, embed, 4, hidden, drop_rate)
         self.mlp_final = MLP(embed, 1, 4, hidden, drop_rate,
-                             is_output_layer=True)
+                             is_output_layer=True, dtype=dtype)
         self.gconv = nn.ModuleList()
         self.skip = nn.ModuleList()
         self.batchnorm = nn.ModuleList()
         for i in range(num_layers):
-            self.gconv.append(GCNConv(self.AA, embed, embed))
-            self.skip.append(nn.Linear(embed, embed))
-            self.batchnorm.append(nn.BatchNorm1d(embed))
+            self.gconv.append(GCNConv(self.AA, embed, embed, dtype=dtype))
+            self.skip.append(nn.Linear(embed, embed, dtype=dtype))
+            self.batchnorm.append(nn.BatchNorm1d(embed, dtype=dtype))
         self.dropout = nn.Dropout(drop_rate)
 
     def forward(self, r):  # r: (n, batch_size)
