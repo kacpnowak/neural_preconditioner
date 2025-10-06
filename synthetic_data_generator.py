@@ -367,3 +367,29 @@ def create_synthetic_matrix(Lx, dxm, cartesian):
         jsmooth, metric = make_smooth(jMt, jelem_area, jdx, jdy, jnn_num, jnn_pos, jtri, n2d, e2d, False)
         ss, ii, jj = make_smat(jnn_pos, jnn_num, jsmooth, n2d, int(jnp.sum(jnn_num)))
     return ss, ii, jj, tri, xcoord, ycoord
+
+def create_fesom_matrix(xcoord, ycoord, tri):
+    tri = np.array(tri)
+    n2d = len(xcoord)  # The number of vertices(nodes)
+    e2d = len(tri[:, 1])  # The number of triangles(elements)
+    cyclic = 0  # 1 if mesh is cyclic
+    cyclic_length = 360  # in degrees; if not cyclic, take it larger than  zonal size
+    cyclic_length = cyclic_length * math.pi / 180  # DO NOT TOUCH
+    ne_num, ne_pos = neighboring_triangles(n2d, e2d, tri)
+    nn_num, nn_pos = neighbouring_nodes(n2d, tri, ne_num, ne_pos)
+    area, elem_area, dx, dy, Mt = areas(n2d, e2d, tri, xcoord, ycoord, ne_num, ne_pos, "r", False, cyclic_length)
+    
+    # Move data to JAX
+    jelem_area = jnp.array(elem_area)
+    jdx = jnp.array(dx)
+    jdy = jnp.array(dy)
+    jnn_num = jnp.array(nn_num)
+    jnn_pos = jnp.array(nn_pos)
+    jtri = jnp.array(tri)
+    jarea = jnp.array(area)
+    jMt = jnp.array(Mt)
+    
+    with jax.default_device(jax.devices("cpu")[0]): # Force JAX to use CPU
+        jsmooth, metric = make_smooth(jMt, jelem_area, jdx, jdy, jnn_num, jnn_pos, jtri, n2d, e2d, False)
+        ss, ii, jj = make_smat(jnn_pos, jnn_num, jsmooth, n2d, int(jnp.sum(jnn_num)))
+    return ss, ii, jj, tri, xcoord, ycoord
