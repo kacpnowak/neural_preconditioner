@@ -91,7 +91,7 @@ class GNP_JAX_Model:
             return A_mat @ v
 
         @jax.jit
-        def train_step(state, x_or_b, k_idx, dropout_key):
+        def train_step(state, x_or_b, k_idx, dropout_key, dyn_A, dyn_hier):
             x_base = x_or_b.astype(self.dtype)
             
             def l1_loss(pred, target):
@@ -99,57 +99,18 @@ class GNP_JAX_Model:
 
             def loss_fn(params):
                 def apply_M(val):
-                    return state.apply_fn({'params': params}, val, A_mat, train=True, rngs={'dropout': dropout_key})
+                    return state.apply_fn({'params': params}, val, dyn_hier, train=True, rngs={'dropout': dropout_key})
+                
+                def apply_A(v):
+                    return dyn_A @ v
                 
                 b_target = apply_A(x_base) if self.training_data != 'no_x' else x_base
                 
-                def pass_1(_):
-                    x_out = apply_M(b_target)
-                    b_out = apply_A(x_out)
-                    return l1_loss(b_out, b_target)
-                    
-                def pass_2(_):
-                    x_1 = apply_M(b_target)
-                    r_1 = b_target - apply_A(x_1)
-                    x_out = x_1 + apply_M(r_1)
-                    b_out = apply_A(x_out)
-                    return l1_loss(b_out, b_target)
-
-                def pass_3(_):
-                    x_1 = apply_M(b_target)
-                    r_1 = b_target - apply_A(x_1)
-                    x_2 = x_1 + apply_M(r_1)
-                    r_2 = b_target - apply_A(x_2)
-                    x_out = x_2 + apply_M(r_2)
-                    b_out = apply_A(x_out)
-                    return l1_loss(b_out, b_target)
-                    
-                def pass_4(_):
-                    x_1 = apply_M(b_target)
-                    r_1 = b_target - apply_A(x_1)
-                    x_2 = x_1 + apply_M(r_1)
-                    r_2 = b_target - apply_A(x_2)
-                    x_3 = x_2 + apply_M(r_2)
-                    r_3 = b_target - apply_A(x_3)
-                    x_out = x_3 + apply_M(r_3)
-                    b_out = apply_A(x_out)
-                    return l1_loss(b_out, b_target)
-
-                def pass_5(_):
-                    x_1 = apply_M(b_target)
-                    r_1 = b_target - apply_A(x_1)
-                    x_2 = x_1 + apply_M(r_1)
-                    r_2 = b_target - apply_A(x_2)
-                    x_3 = x_2 + apply_M(r_2)
-                    r_3 = b_target - apply_A(x_3)
-                    x_4 = x_3 + apply_M(r_3)
-                    r_4 = b_target - apply_A(x_4)
-                    x_out = x_4 + apply_M(r_4)
-                    b_out = apply_A(x_out)
-                    return l1_loss(b_out, b_target)
-                    
-                branches = [pass_1, pass_2, pass_3, pass_4, pass_5]
-                return jax.lax.switch(k_idx, branches, None)
+                # Since we restricted training to 1 pass (V-cycle), we can just hardcode the single pass natively!
+                # This completely eliminates JAX scan list-capturing unroll blowup.
+                x_out = apply_M(b_target)
+                b_out = apply_A(x_out)
+                return l1_loss(b_out, b_target)
 
             loss, grads = jax.value_and_grad(loss_fn)(state.params)
             state = state.apply_gradients(grads=grads)
@@ -187,7 +148,7 @@ class GNP_JAX_Model:
             k_idx = k_passes - 1
             pass_counts[k_passes] = pass_counts.get(k_passes, 0) + 1
             
-            state, loss_val = train_step(state, batch, k_idx, drop_key)
+            state, loss_val = train_step(state, batch, k_idx, drop_key, A_mat, self.hierarchy)
 
             loss_item = loss_val.item()
             hist_loss.append(loss_item)
@@ -213,15 +174,19 @@ class GNP_JAX_Model:
     def get_preconditioner_apply(self) -> Callable:
         """ Returns a callable for applying the preconditioner. """
         
-        A_mat = self.A
-
+        # We must capture the hierarchy dynamically inside the wrapper
+        # to prevent XLA from constant folding the sparse indices at compile time.
+        
         @jax.jit
-        def apply_fn(params, r):
+        def apply_fn(params, r, dyn_hier):
             r = r.reshape(-1, 1)
-            z = self.net_apply({'params': params}, r, A_mat, train=False)
+            z = self.net_apply({'params': params}, r, dyn_hier, train=False)
             return z.flatten()
 
-        return apply_fn
+        def wrapper_apply(params, r):
+            return apply_fn(params, r, self.hierarchy)
+
+        return wrapper_apply
 
 
 if __name__ == '__main__':

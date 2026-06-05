@@ -8,12 +8,18 @@ def scale_A_by_spectral_radius_jax(A_scipy):
     Compute spectral radius estimate and scale matrix in SciPy,
     then convert to JAX BCOO sparse matrix.
     """
+    import numpy as np
     abs_A = abs(A_scipy)
-    row_sum = abs_A.sum(axis=1).A1
-    col_sum = abs_A.sum(axis=0).A1
+    row_sum = np.asarray(abs_A.sum(axis=1)).ravel()
+    col_sum = np.asarray(abs_A.sum(axis=0)).ravel()
     gamma = min(max(row_sum), max(col_sum))
     scaled_A = A_scipy / gamma
     
+    # Force conversion to scipy sparse if it's a dense numpy array
+    import scipy.sparse
+    if not scipy.sparse.issparse(scaled_A):
+        scaled_A = scipy.sparse.csr_matrix(scaled_A)
+        
     A_jax = sparse.BCOO.from_scipy_sparse(scaled_A)
     return A_jax, gamma
 

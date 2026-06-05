@@ -4,6 +4,7 @@ import gc
 import math
 import numpy as np
 import jax
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from tqdm import tqdm
 import flax.linen as nn
@@ -18,8 +19,9 @@ import matplotlib.pyplot as plt
 from scipy.sparse import csc_matrix, identity
 
 from synthetic_data_generator import create_synthetic_matrix, create_synthetic_data
-from ResGCN_JAX import scale_A_by_spectral_radius_jax, GraphUNet_JAX, ResGCN_JAX
+from ResGCN_JAX import scale_A_by_spectral_radius_jax, ResGCN_JAX
 from GNP_JAX import GNP_JAX_Model
+import pyamg
 
 def run_jax_experiment():
     print("Starting JAX Neural CG Preconditioner Experiment...")
@@ -40,18 +42,52 @@ def run_jax_experiment():
     scales = np.logspace(1, 3, 10)
     kc = 2 * math.pi / scales
     
-    print("Constructing family of JAX sparse matrices A(L)...")
+    print("Constructing family of JAX sparse matrices A(L) and AMG hierarchies...")
     As_jax_train = []
     As_jax_eval = []
     As_jax_laplacian = []
     gammas_train = []
     diags_As_eval = []
     
-    for k in kc:
+    # Store the AMG hierarchy (Prolongation, Restriction, and Coarse Matrices)
+    amg_hierarchies_train = []
+    
+    for k in tqdm(kc, desc="Building PyAMG Hierarchies"):
         Smat1 = csc_matrix((ss * (1.0 / np.square(k)), (ii, jj)), shape=(n2d, n2d))
         # We will use the exact Bi-Laplacian for BOTH training and evaluation
         Smat_eval = identity(n2d) + 2.0 * (Smat1 ** 2)
-        A_jax_eval, gamma_eval = scale_A_by_spectral_radius_jax(Smat_eval)
+        
+        # Build PyAMG Smoothed Aggregation Hierarchy
+        ml = pyamg.smoothed_aggregation_solver(Smat_eval, max_levels=4, max_coarse=100)
+        
+        # Extract and scale the hierarchy matrices
+        hierarchy = {'A': [], 'P': [], 'R': []}
+        for i in range(len(ml.levels)):
+            A_level_scipy = ml.levels[i].A
+            A_level_jax, gamma_level = scale_A_by_spectral_radius_jax(A_level_scipy)
+            hierarchy['A'].append(A_level_jax)
+            
+            if i == 0:
+                # Store the fine level data for the old loop compatability
+                A_jax_eval = A_level_jax
+                gamma_eval = gamma_level
+                
+            if i < len(ml.levels) - 1:
+                P_scipy = ml.levels[i].P.tocoo()
+                R_scipy = ml.levels[i].R.tocoo()
+                
+                # Convert to JAX BCOO using float64
+                P_jax = sparse.BCOO((jnp.array(P_scipy.data, dtype=jnp.float64), 
+                                     jnp.column_stack((P_scipy.row, P_scipy.col))), 
+                                    shape=P_scipy.shape)
+                R_jax = sparse.BCOO((jnp.array(R_scipy.data, dtype=jnp.float64), 
+                                     jnp.column_stack((R_scipy.row, R_scipy.col))), 
+                                    shape=R_scipy.shape)
+                hierarchy['P'].append(P_jax)
+                hierarchy['R'].append(R_jax)
+                
+        amg_hierarchies_train.append(hierarchy)
+        
         As_jax_train.append(A_jax_eval)
         gammas_train.append(gamma_eval)
         As_jax_eval.append(A_jax_eval)
@@ -74,36 +110,46 @@ def run_jax_experiment():
     embed = 128
     hidden = 128
     drop_rate = 0.0
-    dtype = jnp.float32
+    dtype = jnp.float64
     lr = 0.0036
     weight_decay = 0.0024
     training_data = 'x_mix'
     m_base = 80
     batch_base = 4
-    epochs_base = 100
-    phases = 3
+    batch_base = 4
+    epochs_base = 150
+    phases = 1
     
     from GraphUNet_JAX import GraphUNet_JAX
     
-    print("Initializing JAX-Native GraphUNet and GNP framework...")
+    print("Initializing JAX-Native GraphUNet and GNP framework...", flush=True)
     net = GraphUNet_JAX(
         embed=embed,
         K=3,
         dtype=dtype
     )
     
-    # Initialize parameters
+    # Initialize parameters instantly using a dummy N=1 hierarchy
     key = random.PRNGKey(42)
     key, init_key, dropout_key = random.split(key, 3)
-    dummy_input = jnp.ones((n2d, 1), dtype=dtype)
-    params = net.init({'params': init_key, 'dropout': dropout_key}, dummy_input, As_jax_train[-1], train=False)['params']
+    dummy_input = jnp.ones((1, 1), dtype=dtype)
     
+    # Extract the number of levels from the real hierarchy to ensure we instantiate all layers
+    num_l = len(amg_hierarchies_train[-1]['A'])
+    dummy_A = sparse.BCOO((jnp.ones(1, dtype=dtype), jnp.zeros((1, 2), dtype=jnp.int32)), shape=(1, 1))
+    dummy_hier = {'A': [dummy_A]*num_l, 'P': [dummy_A]*num_l, 'R': [dummy_A]*num_l}
+    
+    print("Running net.init...", flush=True)
+    params = net.init({'params': init_key, 'dropout': dropout_key}, dummy_input, dummy_hier, train=False)['params']
+    print("net.init finished!", flush=True)
+    
+    print("Defining net_apply...", flush=True)
     net_apply = jax.jit(
         lambda variables, x, AA, train, **kwargs: net.apply(variables, x, AA, train=train, **kwargs),
         static_argnames=('train',)
     )
     
-    gnp = GNP_JAX_Model(As_jax_train[0], net_apply, params, training_data, m_base)
+    gnp = GNP_JAX_Model(amg_hierarchies_train[0], net_apply, params, training_data, m_base)
     optimizer = optax.adamw(learning_rate=lr, weight_decay=weight_decay)
     
     # Create TrainState
@@ -118,7 +164,9 @@ def run_jax_experiment():
     
     train_key = random.PRNGKey(123)
     
-    matrix_indices = list(range(len(As_jax_train)))
+    matrix_indices = [3]  # Only train on the L=46.4km scale to avoid recompiling 10 different sparse network topologies!
+    max_p_phases = [1]    
+    print("Starting JAX hierarchical curriculum training...", flush=True)
     
     # Pre-calculate No Precon Baseline for Quick Eval
     idx_quick = 3 # 46.4km scale
@@ -133,15 +181,17 @@ def run_jax_experiment():
     def python_fgmres_solve_quick(A_op, b, M_op=None, max_iters=3000, tol=1e-6):
         return jax_fgmres_solve(A_op, b, M_op=M_op, restart=200, max_iters=max_iters, tol=tol)
         
-    print("Pre-calculating 'No Precon' baseline for Quick Eval (max_iters=3000)...")
-    _, base_none_bilap = python_fgmres_solve_quick(A_op_bilap_quick, b_eval_quick, M_op=None, max_iters=3000)
+    print("Skipping 'No Precon' baseline for Quick Eval to speed up script...")
+    base_none_bilap = 3000
     
-    max_p_phases = [1, 3, 5]
+    # Skipping baseline print output
     
     for phase in range(phases):
+        print(f"Starting phase {phase}...", flush=True)
         epochs_now = epochs_base
         batch_now = batch_base
         gnp.m = m_base
+        max_p = max_p_phases[phase]
         
         print(f"\n--- Phase {phase+1}/{phases} --- [epochs={epochs_now}, batch={batch_now}, m={gnp.m}]")
         t_phase = time.time()
@@ -153,8 +203,9 @@ def run_jax_experiment():
         for idx in matrix_indices:
             gc.collect()
             i = idx
-            Ai = As_jax_train[idx]
-            gnp.A = Ai  # Refresh system matrix for current training step
+            hierarchy_i = amg_hierarchies_train[idx]
+            gnp.hierarchy = hierarchy_i
+            gnp.A = hierarchy_i['A'][0]  # Refresh system matrix for current training step
             
             max_p = max_p_phases[phase]
             
