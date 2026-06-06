@@ -9,31 +9,37 @@ from tqdm import tqdm
 from typing import Callable, Optional, Generator
 
 
-def arnoldi_build(A: jnp.ndarray, m: int = 10, v0: Optional[jnp.ndarray] = None,
-                  key: Optional[random.PRNGKey] = None):
-    """
-    Arnoldi iteration using standard loops.
-    """
+from functools import partial
+
+@partial(jax.jit, static_argnames=['m'])
+def arnoldi_build(A, m, key):
     n = A.shape[0]
-    if v0 is None:
-        v0 = random.normal(key, (n,), dtype=A.dtype)
+    V = jnp.zeros((n, m + 1), dtype=jnp.float64)
+    H = jnp.zeros((m + 1, m), dtype=jnp.float64)
 
-    beta = jnp.linalg.norm(v0)
-    V = jnp.zeros((n, m + 1), dtype=A.dtype)
-    H = jnp.zeros((m + 1, m), dtype=A.dtype)
+    v0 = random.normal(key, (n,), dtype=jnp.float64)
+    v0 = v0 / jnp.linalg.norm(v0)
+    V = V.at[:, 0].set(v0)
 
-    V = V.at[:, 0].set(v0 / beta)
-
-    for j in range(m):
-        w = A @ V[:, j]
-        for k in range(j + 1):
+    def outer_loop(j, val):
+        V, H = val
+        v = A @ V[:, j]
+        
+        def inner_loop(k, val_inner):
+            w, H_inner = val_inner
             h_k_j = jnp.dot(V[:, k], w)
-            H = H.at[k, j].set(h_k_j)
+            H_inner = H_inner.at[k, j].set(h_k_j)
             w = w - h_k_j * V[:, k]
+            return w, H_inner
+
+        w, H = jax.lax.fori_loop(0, j + 1, inner_loop, (v, H))
+        
         h_j_plus_1_j = jnp.linalg.norm(w)
         H = H.at[j + 1, j].set(h_j_plus_1_j)
         V = V.at[:, j + 1].set(w / h_j_plus_1_j)
+        return V, H
 
+    V, H = jax.lax.fori_loop(0, m, outer_loop, (V, H))
     return V, H
 
 
@@ -49,6 +55,7 @@ def create_streaming_dataset(A: jnp.ndarray, batch_size: int, training_data: str
         Vm1, barHm = arnoldi_build(A, m=m, key=subkey)
         _W, S, Zh = jnp.linalg.svd(barHm, full_matrices=False)
         Q = (Vm1[:, :-1] @ Zh.T) / S.reshape(1, m)
+        Q = jax.block_until_ready(Q)
 
     while True:
         key, subkey = random.split(key)
@@ -116,50 +123,74 @@ class GNP_JAX_Model:
             state = state.apply_gradients(grads=grads)
             return state, loss
 
-        if key is None:
-            key = random.PRNGKey(0)
+        # Pre-split keys for the scan loop
+        key, scan_key = random.split(key)
+        epoch_keys = random.split(scan_key, epochs)
+        
+        # Pre-generate k_idxs
+        key, pass_key = random.split(key)
+        k_passes_arr = random.randint(pass_key, shape=(epochs,), minval=1, maxval=max_passes + 1)
+        k_idxs_arr = k_passes_arr - 1
+        
+        # Compute pass counts for logging
+        unique, counts = np.unique(np.array(k_passes_arr), return_counts=True)
+        pass_counts = dict(zip(unique, counts))
+
+        # Generate Q once eagerly if needed
+        Q = jnp.zeros((1, 1), dtype=self.dtype)
+        if self.training_data in ['x_subspace', 'x_mix']:
+            key, subkey = random.split(key)
+            Vm1, barHm = arnoldi_build(self.A, m=self.m, key=subkey)
+            _W, S, Zh = jnp.linalg.svd(barHm, full_matrices=False)
+            Q = (Vm1[:, :-1] @ Zh.T) / S.reshape(1, self.m)
+            Q = jax.block_until_ready(Q)
+
+        A_mat = self.A
+        
+        def scan_body(state, elements):
+            epoch_key, k_idx = elements
             
-        key, data_key = random.split(key)
-        # Assuming run_cg_preconditioner imports create_streaming_dataset_jax locally now
-        # We will keep the default data generation if called normally
-        try:
-            from synthetic_data_generator import create_streaming_dataset_jax
-            data_generator = create_streaming_dataset_jax(self.A, batch_size, self.training_data, self.m, data_key)
-        except:
-            data_generator = create_streaming_dataset(self.A, batch_size, self.training_data, self.m, key)
+            # Generate data
+            if self.training_data == 'x_normal':
+                batch = random.normal(epoch_key, (A_mat.shape[0], batch_size), dtype=self.dtype)
+            elif self.training_data == 'x_subspace':
+                e = random.normal(epoch_key, (self.m, batch_size), dtype=self.dtype)
+                batch = jnp.dot(Q, e)
+            elif self.training_data == 'x_mix':
+                batch_size1 = batch_size // 2
+                batch_size2 = batch_size - batch_size1
+                key1, key2 = random.split(epoch_key)
+                e = random.normal(key1, (self.m, batch_size1), dtype=self.dtype)
+                x1 = jnp.dot(Q, e)
+                x2 = random.normal(key2, (A_mat.shape[0], batch_size2), dtype=self.dtype)
+                batch = jnp.concatenate([x1, x2], axis=1)
+            else:
+                batch = random.normal(epoch_key, (A_mat.shape[0], batch_size), dtype=self.dtype)
 
-        hist_loss = []
-        best_loss = jnp.inf
-        best_epoch = -1
+            # Drop key for dropout
+            drop_key, _ = random.split(epoch_key)
+            
+            state_out, loss_val = train_step(state, batch, k_idx, drop_key, A_mat, self.hierarchy)
+            return state_out, loss_val
+
+        # Compile and execute the full training phase
+        @jax.jit
+        def train_phase(state_in, epoch_keys_in, k_idxs_in):
+            final_state, all_losses = jax.lax.scan(scan_body, state_in, (epoch_keys_in, k_idxs_in))
+            return final_state, all_losses
+
+        state, all_losses = train_phase(state, epoch_keys, k_idxs_arr)
+        state = jax.block_until_ready(state)
+        
+        hist_loss = np.array(all_losses)
+        best_epoch = np.argmin(hist_loss)
+        best_loss = hist_loss[best_epoch]
         best_params = state.params
-
+        
         if checkpoint_dir:
             os.makedirs(checkpoint_dir, exist_ok=True)
-
-        pbar = tqdm(total=epochs, desc='Train') if progress_bar else None
-        
-        pass_counts = {}
-
-        for epoch in range(epochs):
-            batch = next(data_generator)
-            key, k_key, drop_key = random.split(key, 3)
-            
-            k_passes = random.randint(k_key, shape=(), minval=1, maxval=max_passes + 1).item()
-            k_idx = k_passes - 1
-            pass_counts[k_passes] = pass_counts.get(k_passes, 0) + 1
-            
-            state, loss_val = train_step(state, batch, k_idx, drop_key, A_mat, self.hierarchy)
-
-            loss_item = loss_val.item()
-            hist_loss.append(loss_item)
-
-            if loss_item < best_loss:
-                best_loss = loss_item
-                best_epoch = epoch
-                best_params = state.params
-                if checkpoint_dir:
-                    checkpoints.save_checkpoint(ckpt_dir=checkpoint_dir, target=state.params, step=best_epoch,
-                                                prefix='gnp_model_', overwrite=True)
+            checkpoints.save_checkpoint(ckpt_dir=checkpoint_dir, target=state.params, step=int(best_epoch),
+                                        prefix='gnp_model_', overwrite=True)
 
             if progress_bar:
                 pbar.set_description(f'Train loss {loss_item:.1e}')

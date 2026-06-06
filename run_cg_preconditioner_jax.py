@@ -116,8 +116,7 @@ def run_jax_experiment():
     training_data = 'x_mix'
     m_base = 80
     batch_base = 4
-    batch_base = 4
-    epochs_base = 150
+    epochs_base = 2000
     phases = 1
     
     from GraphUNet_JAX import GraphUNet_JAX
@@ -164,7 +163,7 @@ def run_jax_experiment():
     
     train_key = random.PRNGKey(123)
     
-    matrix_indices = [3]  # Only train on the L=46.4km scale to avoid recompiling 10 different sparse network topologies!
+    matrix_indices = range(len(amg_hierarchies_train))  # Train on ALL 10 geographical scales!
     max_p_phases = [1]    
     print("Starting JAX hierarchical curriculum training...", flush=True)
     
@@ -193,7 +192,7 @@ def run_jax_experiment():
         gnp.m = m_base
         max_p = max_p_phases[phase]
         
-        print(f"\n--- Phase {phase+1}/{phases} --- [epochs={epochs_now}, batch={batch_now}, m={gnp.m}]")
+        print(f"\n--- Phase {phase+1}/{phases} --- [epochs={epochs_now}, batch={batch_now}, m={gnp.m}]", flush=True)
         t_phase = time.time()
         
         # Randomize matrix order after the first phase to prevent catastrophic forgetting
@@ -216,7 +215,7 @@ def run_jax_experiment():
                 checkpoint_dir=ckpt_dir, progress_bar=False
             )
             
-            print(f"  Matrix {i:03d} (Scale L={scales[i]:.1f}km) | Best Loss: {best_loss:.4e} at epoch {best_epoch} | Passes drawn: {pass_counts}")
+            print(f"  Matrix {i:03d} (Scale L={scales[i]:.1f}km) | Best Loss: {best_loss:.4e} at epoch {best_epoch} | Passes drawn: {pass_counts}", flush=True)
             
         # --- QUICK EVAL LOGIC (USING PRECOMPUTED BASELINES) ---
         gnp.A = As_jax_eval[idx_quick]
@@ -330,7 +329,8 @@ def run_jax_experiment():
         print(f"Scale L={scales[i]:.1f}km | No Precon: {it_none} iters | Jacobi: {it_jac} iters | GNP: {it_gnp} iters")
 
     print("\nSaving best parameters to disk...")
-    checkpoints.save_checkpoint(ckpt_dir='./checkpoints_bilaplacian', target=state.params, step=0, overwrite=True)
+    abs_ckpt_dir = os.path.abspath('./checkpoints_bilaplacian')
+    checkpoints.save_checkpoint(ckpt_dir=abs_ckpt_dir, target=state.params, step=0, overwrite=True)
 
     # 5. Plot JAX CG results
     plt.figure(figsize=(10, 6))
