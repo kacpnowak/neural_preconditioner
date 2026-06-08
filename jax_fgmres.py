@@ -2,17 +2,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-def jax_fgmres_solve(A_op, b, M_op=None, restart=150, max_iters=1000, tol=1e-6):
+def jax_fgmres_solve(A_op, b, M_op=None, restart=150, max_iters=1000, tol=1e-6, dtype=jnp.float32):
     """
     Mixed-precision Flexible GMRES implemented in pure JAX using jax.lax control flow.
-    A_op and M_op should accept and return float32 vectors.
-    Orthogonalization (V, Z, H) is performed in float32 to maintain precision.
+    A_op and M_op should accept and return vectors.
+    Orthogonalization (V, Z, H) is performed in the specified dtype.
     """
     n = b.shape[0]
     
-    # We will use float32 for the subspace matrices to prevent stalling at 1e-5
-    dtype_high = jnp.float32
-    dtype_low = jnp.float32
+    dtype_high = dtype
+    dtype_low = dtype
 
     def fgmres_restart_cond(state):
         x, r, iters, converged = state
