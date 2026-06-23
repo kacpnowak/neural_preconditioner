@@ -173,3 +173,5 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 checkpoints_cg_jax/
+
+checkpoints_*/

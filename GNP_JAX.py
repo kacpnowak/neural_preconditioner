@@ -81,11 +81,12 @@ class GNP_JAX_Model:
     Graph Neural Preconditioner implementation using JAX and Flax.
     """
 
-    def __init__(self, A: jnp.ndarray, net_apply: Callable, net_params, training_data: str, m: int):
+    def __init__(self, A: jnp.ndarray, net_apply: Callable, net_params, training_data: str, m: int, custom_b_train: Optional[jnp.ndarray] = None):
         self.A = A
         self.net_apply = net_apply
         self.training_data = training_data
         self.m = m
+        self.custom_b_train = custom_b_train
         self.dtype = next(iter(jax.tree_util.tree_leaves(net_params))).dtype
 
     def train(self, batch_size: int, epochs: int, state: train_state.TrainState,
@@ -111,7 +112,7 @@ class GNP_JAX_Model:
                 def apply_A(v):
                     return dyn_A @ v
                 
-                b_target = apply_A(x_base) if self.training_data != 'no_x' else x_base
+                b_target = apply_A(x_base) if self.training_data not in ['no_x', 'b_custom'] else x_base
                 
                 # Since we restricted training to 1 pass (V-cycle), we can just hardcode the single pass natively!
                 # This completely eliminates JAX scan list-capturing unroll blowup.
@@ -147,8 +148,12 @@ class GNP_JAX_Model:
 
         A_mat = self.A
         
-        def scan_body(state, elements):
-            epoch_key, k_idx = elements
+        # Chop up the JIT: We only JIT the train_step. The training loop runs in Python.
+        # This prevents XLA from attempting to globally optimize 2000 epochs of the GraphUNet.
+        hist_loss = []
+        for i in range(epochs):
+            epoch_key = epoch_keys[i]
+            k_idx = k_idxs_arr[i]
             
             # Generate data
             if self.training_data == 'x_normal':
@@ -160,29 +165,30 @@ class GNP_JAX_Model:
                 batch_size1 = batch_size // 2
                 batch_size2 = batch_size - batch_size1
                 key1, key2 = random.split(epoch_key)
-                e = random.normal(key1, (self.m, batch_size1), dtype=self.dtype)
-                x1 = jnp.dot(Q, e)
-                x2 = random.normal(key2, (A_mat.shape[0], batch_size2), dtype=self.dtype)
-                batch = jnp.concatenate([x1, x2], axis=1)
-            else:
+                
+                batch1 = random.normal(key1, (A_mat.shape[0], batch_size1), dtype=self.dtype)
+                e = random.normal(key2, (self.m, batch_size2), dtype=self.dtype)
+                batch2 = jnp.dot(Q, e)
+                batch = jnp.concatenate((batch1, batch2), axis=1)
+            elif self.training_data == 'no_x':
                 batch = random.normal(epoch_key, (A_mat.shape[0], batch_size), dtype=self.dtype)
+            elif self.training_data == 'b_custom':
+                idx = random.randint(epoch_key, shape=(batch_size,), minval=0, maxval=self.custom_b_train.shape[1])
+                batch = self.custom_b_train[:, idx]
 
             # Drop key for dropout
             drop_key, _ = random.split(epoch_key)
             
-            state_out, loss_val = train_step(state, batch, k_idx, drop_key, A_mat, self.hierarchy)
-            return state_out, loss_val
-
-        # Compile and execute the full training phase
-        @jax.jit
-        def train_phase(state_in, epoch_keys_in, k_idxs_in):
-            final_state, all_losses = jax.lax.scan(scan_body, state_in, (epoch_keys_in, k_idxs_in))
-            return final_state, all_losses
-
-        state, all_losses = train_phase(state, epoch_keys, k_idxs_arr)
+            state, loss_val = train_step(state, batch, k_idx, drop_key, A_mat, self.hierarchy)
+            
+            if progress_bar and i % 10 == 0:
+                print(f"Epoch {i}/{epochs} | Step Loss: {loss_val:.6e}", flush=True)
+                
+            hist_loss.append(loss_val)
+            
         state = jax.block_until_ready(state)
         
-        hist_loss = np.array(all_losses)
+        hist_loss = np.array(hist_loss)
         best_epoch = np.argmin(hist_loss)
         best_loss = hist_loss[best_epoch]
         best_params = state.params
@@ -191,13 +197,6 @@ class GNP_JAX_Model:
             os.makedirs(checkpoint_dir, exist_ok=True)
             checkpoints.save_checkpoint(ckpt_dir=checkpoint_dir, target=state.params, step=int(best_epoch),
                                         prefix='gnp_model_', overwrite=True)
-
-            if progress_bar:
-                pbar.set_description(f'Train loss {loss_item:.1e}')
-                pbar.update()
-
-        if progress_bar:
-            pbar.close()
 
         checkpoint_file = os.path.join(checkpoint_dir, 'gnp_model_' + str(best_epoch)) if checkpoint_dir and best_epoch != -1 else None
         return state.replace(params=best_params), hist_loss, best_loss, best_epoch, checkpoint_file, key, pass_counts

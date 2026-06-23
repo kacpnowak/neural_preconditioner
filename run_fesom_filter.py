@@ -105,12 +105,14 @@ def main():
         
     # Make sure we only take the nodes if it's somehow larger
     sst = sst[:n2d]
-    b = jnp.array(sst, dtype=jnp.float64)
-    x0 = jnp.zeros_like(b)
-    
     # Check for NaN in data
-    valid_mask = ~jnp.isnan(b)
-    b = jnp.where(valid_mask, b, 0.0) # Fill NaNs with 0 for the filter
+    valid_mask = ~np.isnan(sst)
+    sst = np.where(valid_mask, sst, 0.0) # Fill NaNs with 0 for the filter
+    
+    # Compute the perturbation vector as the RHS for FGMRES
+    # ttw = ttu - Smat @ ttu
+    b_numpy = sst - A_scipy @ sst
+    b = jnp.array(b_numpy, dtype=jnp.float64)
     
     # Setup JAX matrices
     # We will scale A to have spectral radius ~1 to ensure Unet stability
@@ -154,7 +156,7 @@ def main():
     # We could evaluate un-trained random weights, but let's load a checkpoint trained on the synthetic 16.7km matrix
     # and see if it generalizes zero-shot to FESOM real data!
     print("Restoring pretrained checkpoint...")
-    state = checkpoints.restore_checkpoint(ckpt_dir='./checkpoints_cg_jax/phase_1/gnp_model_1977', target=state)
+    state = checkpoints.restore_checkpoint(ckpt_dir='./checkpoints_fesom_300', target=state)
     
     @jax.jit
     def net_apply_jit(params, x, hierarchy, **kwargs):
